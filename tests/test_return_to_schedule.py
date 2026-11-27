@@ -24,11 +24,13 @@ class TestReturn(unittest.IsolatedAsyncioTestCase):
     async def exercise(self,initial,updates,expected,success=True):
         calls=[]; updates=iter(updates)
         obj=SimpleNamespace(command_lock=asyncio.Lock(),data={'m':initial},last_update_success=True,oauth=SimpleNamespace(token=['write']))
-        async def refresh(): obj.data={'m':next(updates)}
+        async def refresh(source):
+            self.assertEqual(source, "command")
+            obj.data={'m':next(updates)}
         async def request(endpoint,**kwargs):
             calls.append(endpoint)
             return {'status':'ok'}
-        obj.async_refresh=refresh;obj._request=request
+        obj.async_refresh_for=refresh;obj._request=request
         if success: await run(obj,'m','preset','schedule')
         else:
             with self.assertRaises(HomeAssistantError): await run(obj,'m','preset','schedule')

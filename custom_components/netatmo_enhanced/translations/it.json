@@ -16,11 +16,21 @@
   "options": {
     "step": {
       "init": {
-        "title": "Webhook sperimentale",
-        "description": "Per il primo collaudo usa Solo ricezione. Poi abilita l’aggiornamento API e verifica una modifica effettuata dall’app.",
+        "title": "Impostazioni webhook",
+        "description": "Scegli come le notifiche Netatmo aggiornano Home Assistant. L’aggiornamento diretto è sperimentale e mantiene il polling API di riserva.",
         "data": {
           "webhook_mode": "Modalità webhook"
         }
+      }
+    }
+  },
+  "selector": {
+    "webhook_mode": {
+      "options": {
+        "off": "Disattivato",
+        "receive": "Solo ricezione",
+        "refresh": "Ricezione e aggiornamento API",
+        "push": "Aggiornamento diretto (Cloud Push)"
       }
     }
   },

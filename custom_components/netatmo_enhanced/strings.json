@@ -2,29 +2,39 @@
   "config": {
     "step": {
       "reauth_confirm": {
-        "title": "Ricollega Netatmo Enhanced",
-        "description": "Autorizza nuovamente Netatmo Enhanced, concedendo anche i permessi di controllo di Smarther e termostato."
+        "title": "Reconnect Netatmo Enhanced",
+        "description": "Authorize Netatmo Enhanced again and grant permission to control Smarther and thermostat devices."
       }
     },
     "abort": {
-      "already_configured": "Netatmo Enhanced è già configurato.",
-      "reauth_successful": "Autenticazione aggiornata.",
-      "missing_configuration": "Inserisci le credenziali applicative personali.",
-      "oauth_error": "Autenticazione OAuth non riuscita."
+      "already_configured": "Netatmo Enhanced is already configured.",
+      "reauth_successful": "Authentication updated.",
+      "missing_configuration": "Enter your personal application credentials.",
+      "oauth_error": "OAuth authentication failed."
     }
   },
   "options": {
     "step": {
       "init": {
-        "title": "Webhook sperimentale",
-        "description": "Per il primo collaudo usa Solo ricezione. Poi abilita l’aggiornamento API e verifica una modifica effettuata dall’app.",
+        "title": "Webhook settings",
+        "description": "Choose how Netatmo notifications update Home Assistant. Direct update is experimental and uses periodic API polling as a fallback.",
         "data": {
-          "webhook_mode": "Modalità webhook"
+          "webhook_mode": "Webhook mode"
         }
       }
     }
   },
+  "selector": {
+    "webhook_mode": {
+      "options": {
+        "off": "Disabled",
+        "receive": "Receive only",
+        "refresh": "Receive and refresh via API",
+        "push": "Direct update (Cloud Push)"
+      }
+    }
+  },
   "application_credentials": {
-    "description": "Crea una nuova applicazione personale su https://dev.netatmo.com/ e inserisci Client ID e Client Secret. Non usare le credenziali dell'integrazione ufficiale."
+    "description": "Create a personal application at https://dev.netatmo.com/ and enter its client ID and client secret. Use a separate application for the official Netatmo integration."
   }
 }

@@ -142,6 +142,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         fake = {
             "aiohttp": SimpleNamespace(ClientError=OSError, ClientTimeout=Mock()),
             "homeassistant": ModuleType("homeassistant"),
+            "homeassistant.core": SimpleNamespace(callback=lambda func: func),
             "homeassistant.exceptions": SimpleNamespace(
                 ConfigEntryAuthFailed=LookupError, HomeAssistantError=ValueError
             ),
@@ -203,6 +204,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         await self.coordinator._async_refresh(raise_on_entry_error=True)
         await self.coordinator._async_refresh(scheduled=True)
         await self.coordinator.async_refresh()
+        self.coordinator.guard.pop("refresh_started")
         timing = {}
         await asyncio.gather(self.coordinator.async_refresh_for("webhook", timing),
                              self.coordinator.async_refresh_for("command"))

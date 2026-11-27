@@ -1,0 +1,40 @@
+{
+  "config": {
+    "step": {
+      "reauth_confirm": {
+        "title": "Reconnect Netatmo Enhanced",
+        "description": "Authorize Netatmo Enhanced again and grant permission to control Smarther and thermostat devices."
+      }
+    },
+    "abort": {
+      "already_configured": "Netatmo Enhanced is already configured.",
+      "reauth_successful": "Authentication updated.",
+      "missing_configuration": "Enter your personal application credentials.",
+      "oauth_error": "OAuth authentication failed."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Webhook settings",
+        "description": "Choose how Netatmo notifications update Home Assistant. Direct update is experimental and uses periodic API polling as a fallback.",
+        "data": {
+          "webhook_mode": "Webhook mode"
+        }
+      }
+    }
+  },
+  "selector": {
+    "webhook_mode": {
+      "options": {
+        "off": "Disabled",
+        "receive": "Receive only",
+        "refresh": "Receive and refresh via API",
+        "push": "Direct update (Cloud Push)"
+      }
+    }
+  },
+  "application_credentials": {
+    "description": "Create a personal application at https://dev.netatmo.com/ and enter its client ID and client secret. Use a separate application for the official Netatmo integration."
+  }
+}

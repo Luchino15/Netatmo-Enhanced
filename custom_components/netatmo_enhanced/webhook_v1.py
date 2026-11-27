@@ -151,7 +151,7 @@ class WebhookV1:
                 self._record_wait("command_lock_wait_ms", lock_wait_started, now)
                 guard = self.coordinator.guard
                 ready_at = max(guard.get("until", 0),
-                               guard.get("refresh_started", 0) + MIN_REFRESH_SECONDS)
+                               guard.get("refresh_started", -float("inf")) + MIN_REFRESH_SECONDS)
                 delay = ready_at - now
                 if delay <= 0:
                     batch = list(self._pending)

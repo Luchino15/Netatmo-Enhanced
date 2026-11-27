@@ -202,8 +202,9 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             timing.update(outcome="success", completed_monotonic_s=self.adapter.monotonic())
         self.coordinator.async_refresh_for.side_effect = refreshed
         raw = body("home_event_changed", event_type="schedule")
-        self.assertEqual(await self.request(adapter, raw, [signed(raw)]), 200)
-        await adapter._refresh_task
+        with patch.object(self.adapter, "monotonic", return_value=1.0):
+            self.assertEqual(await self.request(adapter, raw, [signed(raw)]), 200)
+            await asyncio.wait_for(adapter._refresh_task, 1)
         self.assertEqual(self.coordinator.async_refresh_for.await_args.args[0], "webhook")
         self.assertEqual(adapter.diagnostics()["refresh_success"], 1)
 

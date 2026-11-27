@@ -447,7 +447,8 @@ class PushRuntimeTests(IsolatedAsyncioTestCase):
         harness = await self.start()
         fallback_wait = asyncio.Event()
         release_wait = asyncio.Event()
-        simulated_time = harness.coordinator.guard["refresh_started"]
+        simulated_time = 1000.0
+        harness.coordinator.guard["refresh_started"] = simulated_time
         delays = []
 
         def clock():

@@ -5,7 +5,7 @@ def objects(value):
     return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
 
 def number(value):
-    return value if type(value) in (int, float) and isfinite(value) else None
+    return value if type(value) is int or type(value) is float and isfinite(value) else None
 
 def discover(homes):
     """Find BNS devices without hard-coded account identifiers."""
@@ -30,40 +30,70 @@ def snapshot(topology, status, room, module):
     season = status.get("temperature_control_mode", topology.get("temperature_control_mode"))
     if season not in ("heating", "cooling"):
         season = None
-    prefix = {"heating": "therm", "cooling": "cooling"}.get(season)
     schedules = {}
     for kind in ("therm", "cooling"):
         selected = [x for x in objects(topology.get("schedules"))
                     if x.get("type") == kind and x.get("selected") is True]
         schedules[kind] = selected[0] if len(selected) == 1 else {}
-    mode = r.get(f"{prefix}_setpoint_mode") if prefix else None
-    room_mode = mode
-    home_mode = status.get(f"{prefix}_mode", topology.get(f"{prefix}_mode")) if prefix else None
-    if mode is None or (mode in ("home", "schedule") and home_mode in ("away", "hg", "off")):
-        mode = home_mode
     humidity = number(r.get("humidity"))
     if humidity is not None and not 0 <= humidity <= 100:
         humidity = None
-    return {
+    state = {
         "home_id": topology["id"],
         "room_id": rid,
-        "schedule_options": schedule_options(topology, prefix),
         "boiler_status": m.get("boiler_status"),
         "cooler_status": m.get("cooler_status"),
         "season": season,
         "current_temperature": number(r.get("therm_measured_temperature")),
-        "target_temperature": number(r.get(f"{prefix}_setpoint_temperature")) if prefix else None,
         "humidity": humidity,
+        "reachable": m.get("reachable") if type(m.get("reachable")) is bool else None,
+        "room_name": room.get("name") or "Smarther",
+    }
+    for kind, schedule_season in (("therm", "heating"), ("cooling", "cooling")):
+        state.update({
+            f"{kind}_mode": status.get(f"{kind}_mode", topology.get(f"{kind}_mode")),
+            f"{kind}_setpoint_mode": r.get(f"{kind}_setpoint_mode"),
+            f"{kind}_setpoint_temperature": number(r.get(f"{kind}_setpoint_temperature")),
+            f"{kind}_setpoint_end_time": number(r.get(f"{kind}_setpoint_end_time")),
+            f"{schedule_season}_schedule": schedules[kind].get("name"),
+            f"{schedule_season}_schedule_id": schedules[kind].get("id"),
+            f"{schedule_season}_schedule_names": schedule_names(topology, kind),
+            f"{schedule_season}_schedule_options": schedule_options(topology, kind),
+        })
+    return project(state)
+
+
+def project(state):
+    """Derive the existing entity view from the active season's stored fields."""
+    season = state.get("season")
+    prefix = {"heating": "therm", "cooling": "cooling"}.get(season)
+    room_mode = state.get(f"{prefix}_setpoint_mode")
+    home_mode = state.get(f"{prefix}_mode")
+    mode = room_mode
+    if mode is None or (mode in ("home", "schedule") and home_mode in ("away", "hg", "off")):
+        mode = home_mode
+    return {
+        **state,
+        "schedule_options": state.get(f"{season}_schedule_options", {}),
+        "target_temperature": state.get(f"{prefix}_setpoint_temperature"),
         "mode": mode,
         "room_mode": room_mode,
         "home_mode": home_mode,
-        "heating_schedule": schedules["therm"].get("name"),
-        "cooling_schedule": schedules["cooling"].get("name"),
-        "active_schedule": schedules[prefix].get("name") if prefix else None,
-        "active_schedule_id": schedules[prefix].get("id") if prefix else None,
-        "setpoint_end_time": number(r.get(f"{prefix}_setpoint_end_time")) if prefix else None,
-        "reachable": m.get("reachable") if type(m.get("reachable")) is bool else None,
-        "room_name": room.get("name") or "Smarther",
+        "active_schedule": state.get(f"{season}_schedule"),
+        "active_schedule_id": state.get(f"{season}_schedule_id"),
+        "setpoint_end_time": state.get(f"{prefix}_setpoint_end_time"),
+    }
+
+
+def schedule_names(topology, prefix):
+    return {
+        entry["id"]: entry["name"]
+        for entry in objects(topology.get("schedules"))
+        if (
+            entry.get("type") == prefix
+            and isinstance(entry.get("name"), str)
+            and isinstance(entry.get("id"), str)
+        )
     }
 
 

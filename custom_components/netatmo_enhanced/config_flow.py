@@ -1,11 +1,11 @@
 """OAuth configuration with explicit write permissions."""
 import logging
-import voluptuous as vol
-from homeassistant.config_entries import SOURCE_REAUTH, OptionsFlowWithReload
+import probatio
+from homeassistant.config_entries import SOURCE_REAUTH, OptionsFlow
 from homeassistant.core import callback
-from homeassistant.helpers import config_entry_oauth2_flow
+from homeassistant.helpers import config_entry_oauth2_flow, selector
 from .const import DOMAIN, SCOPES
-from .webhook_core import MODE_KEY, MODE_OFF, MODE_RECEIVE, MODE_REFRESH
+from .webhook_core import MODE_KEY, MODE_OFF, MODE_PUSH, MODE_RECEIVE, MODE_REFRESH
 
 class NetatmoEnhancedFlow(
     config_entry_oauth2_flow.AbstractOAuth2FlowHandler, domain=DOMAIN
@@ -48,19 +48,22 @@ class NetatmoEnhancedFlow(
         return self.async_create_entry(title="Netatmo Enhanced", data=data)
 
 
-class WebhookOptionsFlow(OptionsFlowWithReload):
+class WebhookOptionsFlow(OptionsFlow):
+    """Select the webhook behavior of the current config entry."""
+
     async def async_step_init(self, user_input=None):
         if user_input is not None:
             return self.async_create_entry(data={**self.config_entry.options, **user_input})
+        current_mode = self.config_entry.options.get(MODE_KEY, MODE_OFF)
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema({
-                vol.Required(
-                    MODE_KEY, default=self.config_entry.options.get(MODE_KEY, MODE_OFF)
-                ): vol.In({
-                    MODE_OFF: "Disattivato",
-                    MODE_RECEIVE: "Solo ricezione",
-                    MODE_REFRESH: "Ricezione e aggiornamento API",
-                }),
+            data_schema=probatio.Schema({
+                probatio.Required(MODE_KEY, default=current_mode): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=[MODE_OFF, MODE_RECEIVE, MODE_REFRESH, MODE_PUSH],
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                        translation_key=MODE_KEY,
+                    )
+                ),
             }),
         )

@@ -77,10 +77,20 @@ class EnhancedClimate(CoordinatorEntity, ClimateEntity):
 
     @property
     def hvac_action(self):
+        heating = self.values.get("boiler_status")
+        cooling = self.values.get("cooler_status")
+        if type(heating) is bool and type(cooling) is bool:
+            if heating and cooling:
+                return None
+            if heating:
+                return HVACAction.HEATING
+            if cooling:
+                return HVACAction.COOLING
+            return HVACAction.OFF if self.hvac_mode == HVACMode.OFF else HVACAction.IDLE
         if self.hvac_mode == HVACMode.OFF:
             return HVACAction.OFF
         season = self.values.get("season")
-        running = self.values.get("cooler_status" if season == "cooling" else "boiler_status")
+        running = cooling if season == "cooling" else heating
         if running is True:
             return HVACAction.COOLING if season == "cooling" else HVACAction.HEATING
         if running is False:

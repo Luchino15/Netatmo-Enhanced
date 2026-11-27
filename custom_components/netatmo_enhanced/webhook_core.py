@@ -9,6 +9,7 @@ import re
 import time
 
 from .telemetry import EventHistory
+from .cloud_push import home_identity
 
 API_URL = "https://api.netatmo.com/webhooks/v1"
 BODY_LIMIT = 256 * 1024
@@ -19,6 +20,7 @@ MODE_KEY = "webhook_mode"
 MODE_OFF = "off"
 MODE_RECEIVE = "receive"
 MODE_REFRESH = "refresh"
+MODE_PUSH = "push"
 EVENTS = frozenset({
     "webhook_activation", "webhook_deletion", "device_event",
     "home_event_changed", "topology_changed",
@@ -85,12 +87,15 @@ async def ensure_subscription(request, callback_url, *, sleep=asyncio.sleep, det
 class Receiver:
     """Authenticate, classify and coalesce webhook notifications."""
 
-    def __init__(self, secret, known_home, signal_refresh, clock=time.monotonic):
+    def __init__(
+        self, secret, known_home, signal_refresh, clock=time.monotonic, *, signal_push=None
+    ):
         if not isinstance(secret, str) or not secret:
             raise ValueError("Netatmo client secret required")
         self._key = secret.encode("utf-8")
         self._known_home = known_home
         self._signal = signal_refresh
+        self.signal_push = signal_push
         self._clock = clock
         self._seen = OrderedDict()
         self.counts = Counter()
@@ -98,7 +103,7 @@ class Receiver:
 
     def accept(self, raw, signature, received=None):
         if received is None:
-            received = self.history.stamp()
+            received = self.stamp()
         if len(raw) > BODY_LIMIT:
             self.counts["oversized"] += 1
             return 413
@@ -110,7 +115,7 @@ class Receiver:
             self.counts["invalid_signature"] += 1
             return 403
         try:
-            data = json.loads(raw.decode("utf-8"))
+            data = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
         except (ValueError, RecursionError):
             data = None
         if (not isinstance(data, dict)
@@ -122,32 +127,63 @@ class Receiver:
             return 400
 
         kind = data["push_type"]
-        home_id = data.get("home_id")
-        known_home = self._known_home(home_id) if isinstance(home_id, str) else None
+        home_id, problem = home_identity(data)
+        known_home = self._known_home(home_id) if home_id is not None else None
         if kind not in EVENTS:
             self.counts["unknown_event"] += 1
             self.history.record(received, "unknown", data, None, known_home, "unknown_event")
             return 200
-        now = self._clock()
-        while self._seen and next(iter(self._seen.values())) <= now - DEDUP_SECONDS:
-            self._seen.popitem(last=False)
-        digest = hashlib.sha256(raw).digest()
-        if digest in self._seen:
+        if self.signal_push is None and self._retransmission(home_id, raw):
             self.counts["duplicate"] += 1
             self.history.record(received, kind, data, True, known_home, "duplicate")
             return 200
-        self._seen[digest] = now
-        if len(self._seen) > DEDUP_LIMIT:
-            self._seen.popitem(last=False)
 
         self.counts[kind] += 1
         disposition = "registration_event"
         if kind in REFRESH_EVENTS and not known_home:
             self.counts["unmatched_home"] += 1
-            disposition = "unmatched_home" if known_home is False else "missing_home_id"
+            disposition = problem or "unmatched_home"
+            if problem is not None:
+                self.counts[problem] += 1
         elif kind in REFRESH_EVENTS:
             disposition = "eligible"
         record = self.history.record(received, kind, data, False, known_home, disposition)
         if disposition == "eligible":
-            self._signal(record)
+            if self.signal_push is None:
+                self._signal(record)
+            else:
+                self.signal_push(data, record)
         return 200
+
+    def stamp(self):
+        self.counts["received"] += 1
+        return self.history.stamp()
+
+    def set_push_callback(self, callback):
+        self.signal_push = callback
+        self._seen.clear()
+
+    def _retransmission(self, home_id, raw):
+        # Older API-only modes do not project event fields. Suppress only a
+        # repeated body with no intervening event in this home.
+        now = self._clock()
+        while self._seen and next(iter(self._seen.values()))[1] <= now - DEDUP_SECONDS:
+            self._seen.popitem(last=False)
+        digest = hashlib.sha256(raw).digest()
+        seen = self._seen.get(home_id)
+        if seen is not None and seen[0] == digest:
+            return True
+        self._seen[home_id] = digest, now
+        self._seen.move_to_end(home_id)
+        if len(self._seen) > DEDUP_LIMIT:
+            self._seen.popitem(last=False)
+        return False
+
+
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate object key")
+        result[key] = value
+    return result

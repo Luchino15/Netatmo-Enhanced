@@ -99,7 +99,7 @@ class ReceiverTests(unittest.TestCase):
         for sequence in (99, 1):
             raw = body(extra_params={"sequence_id": sequence, "modules": [{"undeclared": 21}]})
             self.assertEqual(self.receiver.accept(raw, signed(raw)), 200)
-        self.assertEqual(self.signal.call_args_list[0].args, ())
+        self.assertEqual(self.signal.call_args_list[0].args[0]["refresh"], "eligible")
         self.assertEqual(self.signal.call_count, 2)
 
     def test_other_notifications_do_not_request_updates(self):
@@ -134,7 +134,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             oauth=SimpleNamespace(implementation=SimpleNamespace(client_secret=SECRET)),
             data={"private-device": {"home_id": "known"}},
             async_webhook_request=AsyncMock(return_value=(200, urls(CALLBACK))),
-            command_lock=asyncio.Lock(), guard={}, async_refresh=AsyncMock(), last_update_success=True,
+            command_lock=asyncio.Lock(), guard={}, async_refresh_for=AsyncMock(),
         )
         self.entry = SimpleNamespace(
             options={}, data={}, async_on_unload=Mock(),
@@ -175,9 +175,9 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         raw = body()
         self.assertEqual(await self.request(adapter, raw, [signed(raw), signed(raw)]), 403)
         self.assertEqual(await self.request(adapter, raw, [signed(raw)]), 200)
-        self.coordinator.async_refresh.assert_not_called()
+        self.coordinator.async_refresh_for.assert_not_called()
         report = json.dumps(adapter.diagnostics())
-        for value in (SECRET, CALLBACK, "private-id", "private-device", "known", signed(raw)):
+        for value in (SECRET, CALLBACK, "private-id", "private-device", '"known"', signed(raw)):
             self.assertNotIn(value, report)
         await adapter.stop()
         self.webhook.async_unregister.assert_called_once_with(self.hass, "private-id")
@@ -191,15 +191,45 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.request(adapter, first, [signed(first)]), 200)
         await asyncio.sleep(0)
         self.assertEqual(await self.request(adapter, second, [signed(second)]), 200)
-        self.coordinator.async_refresh.assert_not_called()
+        self.coordinator.async_refresh_for.assert_not_called()
         self.assertTrue(adapter.diagnostics()["refresh_pending"])
         await adapter.stop()
-        self.coordinator.async_refresh.assert_not_called()
+        self.coordinator.async_refresh_for.assert_not_called()
 
     async def test_deferred_read_uses_coordinator_without_payload(self):
         adapter = self.start(core.MODE_REFRESH)
+        async def refreshed(source, timing):
+            timing.update(outcome="success", completed_monotonic_s=self.adapter.monotonic())
+        self.coordinator.async_refresh_for.side_effect = refreshed
         raw = body("home_event_changed", event_type="schedule")
         self.assertEqual(await self.request(adapter, raw, [signed(raw)]), 200)
         await adapter._refresh_task
-        self.coordinator.async_refresh.assert_awaited_once_with()
+        self.assertEqual(self.coordinator.async_refresh_for.await_args.args[0], "webhook")
         self.assertEqual(adapter.diagnostics()["refresh_success"], 1)
+
+    async def test_command_lock_and_rate_wait_with_coalesced_events(self):
+        adapter = self.start(core.MODE_REFRESH)
+        lock = self.coordinator.command_lock
+        await lock.acquire()
+        first = body(temp=20)
+        second = body(temp=21)
+
+        async def refreshed(source, timing):
+            self.assertTrue(lock.locked())
+            timing.update(outcome="success", completed_monotonic_s=self.adapter.monotonic())
+
+        self.coordinator.async_refresh_for.side_effect = refreshed
+        await self.request(adapter, first, [signed(first)])
+        await asyncio.sleep(0.05)
+        await self.request(adapter, second, [signed(second)])
+        self.coordinator.async_refresh_for.assert_not_called()
+        self.coordinator.guard["until"] = self.adapter.monotonic() + 0.075
+        lock.release()
+        await asyncio.wait_for(adapter._refresh_task, 1)
+        self.coordinator.async_refresh_for.assert_awaited_once()
+        one, two = adapter.diagnostics()["recent_events"]
+        self.assertEqual((one["refresh"], two["refresh"]), ("queued", "coalesced"))
+        self.assertGreater(one["command_lock_wait_ms"], 0)
+        self.assertGreater(one["api_limit_wait_ms"], 0)
+        self.assertGreaterEqual(one["receipt_to_publication_ms"], one["api_limit_wait_ms"])
+        self.assertEqual(one["update"], two["update"])

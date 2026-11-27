@@ -11,6 +11,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .const import BASE_URL, DOMAIN, SCOPES, token_scopes
 from .commands import command, confirmed
 from .model import discover, snapshot
+from .telemetry import ApiMetrics, elapsed_ms, utc_now
 from .webhook_core import API_URL
 
 _LOGGER = logging.getLogger(__name__)
@@ -39,6 +40,58 @@ class EnhancedCoordinator(DataUpdateCoordinator):
         self.guard = hass.data.setdefault(DOMAIN, {}).setdefault(entry.entry_id, {})
         self.lock = asyncio.Lock()
         self.command_lock = asyncio.Lock()
+        self.metrics = ApiMetrics()
+        self._refresh_requests = {}
+        self._active_refreshes = {}
+
+    async def async_refresh_for(self, source, timing=None):
+        """Attribute a refresh to the calling task, including after lock waits."""
+        task = asyncio.current_task()
+        self._refresh_requests[task] = (source, timing if timing is not None else {})
+        try:
+            await self.async_refresh()
+        finally:
+            del self._refresh_requests[task]
+
+    async def _async_refresh(self, log_failures=True, raise_on_auth_failed=False,
+                             scheduled=False, raise_on_entry_error=False):
+        """Measure an actual update through the coordinator's listener publication."""
+        task = asyncio.current_task()
+        default = "periodic" if scheduled else "startup" if raise_on_entry_error else "manual"
+        source, timing = self._refresh_requests.get(task, (default, {}))
+        self._active_refreshes[task] = (source, timing)
+        outcome = "failed"
+        try:
+            await super()._async_refresh(
+                log_failures=log_failures, raise_on_auth_failed=raise_on_auth_failed,
+                scheduled=scheduled, raise_on_entry_error=raise_on_entry_error,
+            )
+            if self.last_update_success:
+                outcome = "success"
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        finally:
+            del self._active_refreshes[task]
+            if "started_monotonic_s" in timing:
+                completed = monotonic()
+                timing.update(
+                    outcome=outcome,
+                    completed_at_utc=utc_now().isoformat(),
+                    completed_monotonic_s=completed,
+                    duration_ms=elapsed_ms(timing["started_monotonic_s"], completed),
+                )
+                if "first_http_started_monotonic_s" in timing:
+                    timing["http_span_ms"] = elapsed_ms(
+                        timing["first_http_started_monotonic_s"], timing["last_http_completed_monotonic_s"]
+                    )
+                if outcome != "success":
+                    timing["failure_reason"] = (
+                        "cancelled" if outcome == "cancelled" else
+                        "api_cooldown" if self.guard.get("until", 0) > completed else
+                        timing.get("last_http_failure", "coordinator_update_failed")
+                    )
+                self.metrics.update(source, outcome)
 
     async def _read(self, endpoint, params=None):
         payload = await self._request(endpoint, params=params)
@@ -60,15 +113,61 @@ class EnhancedCoordinator(DataUpdateCoordinator):
                 return 429, None
             await self.oauth.async_ensure_token_valid()
             kwargs = {"json": body} if method == "POST" else {}
+            status, payload, rate_limit = await self._http_json(
+                method, API_URL, "/webhooks/v1", "registration", 10, **kwargs,
+            )
+            if status == 429:
+                self._record_rate_limit(rate_limit)
+            return status, payload
+
+    async def _http_json(self, method, url, endpoint, source, timeout, **kwargs):
+        """Count calls that reach the HTTP client, even without a response."""
+        headers = {"Authorization": f"Bearer {self.oauth.token['access_token']}"}
+        _, timing = self._active_refreshes.get(asyncio.current_task(), (None, None))
+        started = monotonic()
+        if timing is not None:
+            if "first_http_started_monotonic_s" not in timing:
+                timing["first_http_started_monotonic_s"] = started
+                timing["first_http_started_at_utc"] = utc_now().isoformat()
+            timing["http_requests"] = timing.get("http_requests", 0) + 1
+        status = None
+        outcome = "transport_error"
+        try:
             async with self.http.request(
-                method, API_URL, **kwargs,
-                headers={"Authorization": f"Bearer {self.oauth.token['access_token']}"},
-                timeout=ClientTimeout(total=10), allow_redirects=False,
-                raise_for_status=False,
+                method, url, headers=headers, timeout=ClientTimeout(total=timeout),
+                allow_redirects=False, raise_for_status=False, **kwargs,
             ) as response:
-                if response.status == 429:
-                    self._record_rate_limit(response.headers.get("Retry-After"))
-                return response.status, await response.json() if response.status == 200 else None
+                status = response.status
+                payload = None
+                if 200 <= status < 300:
+                    outcome = "success"
+                    if status != 204:
+                        try:
+                            payload = await response.json()
+                        except TimeoutError:
+                            raise
+                        except (ClientError, ValueError):
+                            outcome = "invalid_response"
+                else:
+                    outcome = "http_error"
+                return status, payload, response.headers.get("Retry-After")
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        except TimeoutError:
+            outcome = "timeout"
+            raise
+        finally:
+            completed = monotonic()
+            duration = elapsed_ms(started, completed)
+            self.metrics.request(source, method, endpoint, duration, status, outcome)
+            if timing is not None:
+                timing["last_http_completed_monotonic_s"] = completed
+                if outcome != "success":
+                    timing["last_http_failure"] = outcome
+                timing["http_duration_ms_total"] = round(
+                    timing.get("http_duration_ms_total", 0.0) + duration, 3
+                )
 
     async def _request(self, endpoint, params=None, form=None, json_body=None):
         if endpoint not in {"homesdata", "homestatus", "setstate", "setthermmode", "switchhomeschedule"}:
@@ -78,32 +177,34 @@ class EnhancedCoordinator(DataUpdateCoordinator):
             if remaining > 0:
                 raise UpdateFailed(f"Netatmo API cooldown: {int(remaining)+1} seconds")
             await self.oauth.async_ensure_token_valid()
+            source, _ = self._active_refreshes.get(asyncio.current_task(), ("command", None))
             try:
-                async with self.http.post(
-                    f"{BASE_URL}/api/{endpoint}",
-                    params=params,
-                    data=form,
-                    json=json_body,
-                    headers={"Authorization": f"Bearer {self.oauth.token['access_token']}"},
-                    timeout=ClientTimeout(total=20),
-                    allow_redirects=False,
-                ) as response:
-                    if response.status == 429:
-                        delay = self._record_rate_limit(response.headers.get("Retry-After"))
-                        raise UpdateFailed(f"Netatmo API rate limit: cooldown {int(delay)} seconds")
-                    if response.status == 401:
-                        raise ConfigEntryAuthFailed("Netatmo authorization expired")
-                    if response.status != 200:
-                        raise UpdateFailed(f"Netatmo {endpoint}: HTTP {response.status}")
-                    payload = await response.json()
-            except (ClientError, TimeoutError, ValueError) as exc:
-                raise UpdateFailed(f"Netatmo {endpoint}: network or invalid JSON") from exc
+                path = f"/api/{endpoint}"
+                status, payload, rate_limit = await self._http_json(
+                    "POST", f"{BASE_URL}{path}", path, source, 20,
+                    params=params, data=form, json=json_body,
+                )
+            except (ClientError, TimeoutError, ValueError):
+                raise UpdateFailed(f"Netatmo {endpoint}: network or invalid JSON") from None
+            if status == 429:
+                delay = self._record_rate_limit(rate_limit)
+                raise UpdateFailed(f"Netatmo API rate limit: cooldown {int(delay)} seconds")
+            if status == 401:
+                raise ConfigEntryAuthFailed("Netatmo authorization expired")
+            if status != 200:
+                raise UpdateFailed(f"Netatmo {endpoint}: HTTP {status}")
             if not isinstance(payload, dict) or payload.get("error") or payload.get("status") not in (None, "ok"):
                 raise UpdateFailed(f"Netatmo {endpoint}: unexpected response")
             return payload
 
     async def _async_update_data(self):
-        self.guard["refresh_started"] = monotonic()
+        start = monotonic()
+        self.guard["refresh_started"] = start
+        _, timing = self._active_refreshes[asyncio.current_task()]
+        timing.update(started_monotonic_s=start, started_at_utc=utc_now().isoformat())
+        return await self._read_snapshots()
+
+    async def _read_snapshots(self):
         # Home mode, season and selected schedules are mutable.
         # Never reuse an hour-old topology for a manual or periodic refresh.
         body = await self._read("homesdata")
@@ -132,7 +233,7 @@ class EnhancedCoordinator(DataUpdateCoordinator):
             if not self.last_update_success or not old:
                 raise HomeAssistantError("Dati non disponibili: aggiorna prima il termostato")
             expected_season = old.get("season")
-            await self.async_refresh()
+            await self.async_refresh_for("command")
             fresh = (self.data or {}).get(mid, {})
             if not self.last_update_success or not fresh or fresh.get("season") != expected_season:
                 raise HomeAssistantError("Stato o stagione cambiati: controlla i valori e riprova")
@@ -147,7 +248,7 @@ class EnhancedCoordinator(DataUpdateCoordinator):
             if result.get("status") != "ok" or (isinstance(response_body, dict) and response_body.get("errors")):
                 raise HomeAssistantError("Netatmo non ha confermato il comando")
             await asyncio.sleep(3)
-            await self.async_refresh()
+            await self.async_refresh_for("command")
             after = (self.data or {}).get(mid, {})
             # A global preset can coexist with a room override. Only after
             # confirming the home has returned to schedule, clear that override.
@@ -168,6 +269,6 @@ class EnhancedCoordinator(DataUpdateCoordinator):
                 if result.get("status") != "ok" or (isinstance(response_body, dict) and response_body.get("errors")):
                     raise HomeAssistantError("Programmazione casa ripristinata, ma annullamento manuale non confermato")
                 await asyncio.sleep(3)
-                await self.async_refresh()
+                await self.async_refresh_for("command")
             if not self.last_update_success or not confirmed(fresh, (self.data or {}).get(mid, {}), kind, value):
                 raise HomeAssistantError("Comando accettato dalle API, ma stato non ancora confermato. Controlla l'app e aggiorna i dati; non ripetere subito il comando.")

@@ -11,14 +11,14 @@ from test_model import model
 source = Path(__file__).resolve().parents[1] / 'custom_components/netatmo_enhanced/coordinator.py'
 parsed = ast.parse(source.read_text())
 cls = next(x for x in parsed.body if isinstance(x, ast.ClassDef) and x.name == 'EnhancedCoordinator')
-method = next(x for x in cls.body if isinstance(x, ast.AsyncFunctionDef) and x.name == '_async_update_data')
+method = next(x for x in cls.body if isinstance(x, ast.AsyncFunctionDef) and x.name == '_read_snapshots')
 class UpdateFailed(Exception):
     pass
 namespace = {'discover': model.discover, 'snapshot': model.snapshot, 'UpdateFailed': UpdateFailed,
              'monotonic': monotonic,
              '_LOGGER': SimpleNamespace(debug=lambda *a: None)}
 exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), 'exec'), namespace)
-refresh = namespace['_async_update_data']
+refresh = namespace['_read_snapshots']
 
 class TestRefresh(unittest.IsolatedAsyncioTestCase):
     async def test_changes_across_successive_reads(self):

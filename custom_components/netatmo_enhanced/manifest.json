@@ -1,0 +1,18 @@
+{
+  "domain": "netatmo_enhanced",
+  "name": "Netatmo Enhanced",
+  "version": "0.3.0",
+  "config_flow": true,
+  "dependencies": [
+    "application_credentials",
+    "webhook"
+  ],
+  "codeowners": [
+    "@Luchino15"
+  ],
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "requirements": [],
+  "documentation": "https://github.com/Luchino15/Netatmo-Enhanced",
+  "issue_tracker": "https://github.com/Luchino15/Netatmo-Enhanced/issues"
+}

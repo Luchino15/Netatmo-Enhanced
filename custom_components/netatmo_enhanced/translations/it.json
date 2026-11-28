@@ -34,6 +34,47 @@
       }
     }
   },
+  "entity": {
+    "sensor": {
+      "override_expires_at": {
+        "name": "Scadenza regolazione temporanea"
+      }
+    }
+  },
+  "services": {
+    "set_boost": {
+      "name": "Imposta Boost",
+      "description": "Avvia o modifica Boost nella stagione attiva.",
+      "fields": {
+        "duration": {
+          "name": "Durata",
+          "description": "Scegli 30, 60 o 90 minuti."
+        }
+      }
+    },
+    "cycle_boost": {
+      "name": "Cambia durata Boost",
+      "description": "Avvia Boost a 30 minuti, poi passa a 60, a 90 e infine interrompilo."
+    },
+    "stop_boost": {
+      "name": "Interrompi Boost",
+      "description": "Termina Boost e restituisce il controllo alla modalità applicabile alla stanza."
+    },
+    "set_manual_temperature": {
+      "name": "Imposta temperatura manuale con durata",
+      "description": "Imposta una temperatura manuale temporanea nella stagione attiva.",
+      "fields": {
+        "temperature": {
+          "name": "Temperatura",
+          "description": "Temperatura richiesta in gradi Celsius."
+        },
+        "duration": {
+          "name": "Durata",
+          "description": "Durata della regolazione manuale in minuti interi, da 1 a 720."
+        }
+      }
+    }
+  },
   "application_credentials": {
     "description": "Crea una nuova applicazione personale su https://dev.netatmo.com/ e inserisci Client ID e Client Secret. Non usare le credenziali dell'integrazione ufficiale."
   }

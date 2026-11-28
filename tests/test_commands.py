@@ -49,3 +49,20 @@ class TestCommands(unittest.TestCase):
         self.assertFalse(c.confirmed(self.s,{**self.s,"mode":"manual","room_mode":"manual","home_mode":"schedule"},"preset","schedule"))
     def test_not_confirmed_if_room_missing(self):
         self.assertFalse(c.confirmed(self.s,{**self.s,"mode":"schedule","home_mode":"schedule"},"preset","schedule"))
+
+    def test_timed_manual_confirmation_rejects_unchanged_previous_deadline(self):
+        requested = 2_000_000_060
+        before = {**self.s, "room_mode": "manual", "target_temperature": 19,
+                  "setpoint_end_time": requested - 30}
+        self.assertFalse(c.confirmed(before, before, "temperature_duration", (19, 1), deadline=requested))
+        after = {**before, "setpoint_end_time": requested}
+        self.assertTrue(c.confirmed(before, after, "temperature_duration", (19, 1), deadline=requested))
+
+    def test_cooling_schedule_uses_current_inventory(self):
+        state = {**self.s, "season": "cooling", "schedule_options": {"Summer A": "c1", "Summer B": "c2"}}
+        for name, sid in state["schedule_options"].items():
+            with self.subTest(schedule=name):
+                self.assertEqual(c.command(state, "schedule", name),
+                                 ("switchhomeschedule", {"home_id": "h", "schedule_id": sid}, None))
+        with self.assertRaises(ValueError):
+            c.command(state, "schedule", "Winter")

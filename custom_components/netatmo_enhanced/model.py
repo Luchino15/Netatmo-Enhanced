@@ -50,11 +50,13 @@ def snapshot(topology, status, room, module):
         "room_name": room.get("name") or "Smarther",
     }
     for kind, schedule_season in (("therm", "heating"), ("cooling", "cooling")):
+        room_mode = r.get(f"{kind}_setpoint_mode")
         state.update({
             f"{kind}_mode": status.get(f"{kind}_mode", topology.get(f"{kind}_mode")),
-            f"{kind}_setpoint_mode": r.get(f"{kind}_setpoint_mode"),
+            f"{kind}_setpoint_mode": room_mode,
             f"{kind}_setpoint_temperature": number(r.get(f"{kind}_setpoint_temperature")),
             f"{kind}_setpoint_end_time": number(r.get(f"{kind}_setpoint_end_time")),
+            f"{kind}_end_time_is_boost": room_mode == "max",
             f"{schedule_season}_schedule": schedules[kind].get("name"),
             f"{schedule_season}_schedule_id": schedules[kind].get("id"),
             f"{schedule_season}_schedule_names": schedule_names(topology, kind),
@@ -72,16 +74,23 @@ def project(state):
     mode = room_mode
     if mode is None or (mode in ("home", "schedule") and home_mode in ("away", "hg", "off")):
         mode = home_mode
+    target = state.get(f"{prefix}_setpoint_temperature")
+    expiry = state.get(f"{prefix}_setpoint_end_time")
+    boost = room_mode == "max"
+    if boost:
+        target = None
+    if boost != bool(state.get(f"{prefix}_end_time_is_boost")):
+        expiry = None
     return {
         **state,
         "schedule_options": state.get(f"{season}_schedule_options", {}),
-        "target_temperature": state.get(f"{prefix}_setpoint_temperature"),
+        "target_temperature": target,
         "mode": mode,
         "room_mode": room_mode,
         "home_mode": home_mode,
         "active_schedule": state.get(f"{season}_schedule"),
         "active_schedule_id": state.get(f"{season}_schedule_id"),
-        "setpoint_end_time": state.get(f"{prefix}_setpoint_end_time"),
+        "setpoint_end_time": expiry,
     }
 
 

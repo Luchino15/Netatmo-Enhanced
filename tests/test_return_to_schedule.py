@@ -13,7 +13,7 @@ class HomeAssistantError(Exception): pass
 class UpdateFailed(Exception): pass
 class ConfigEntryAuthFailed(Exception): pass
 async def sleep(_): pass
-ns=dict(asyncio=SimpleNamespace(sleep=sleep), command=c.command, confirmed=c.confirmed, SCOPES={'write'}, token_scopes=lambda token:set(token), HomeAssistantError=HomeAssistantError,UpdateFailed=UpdateFailed,ConfigEntryAuthFailed=ConfigEntryAuthFailed)
+ns=dict(asyncio=SimpleNamespace(sleep=sleep), command=c.command, confirmed=c.confirmed, NEW_COMMANDS=set(), SCOPES={'write'}, token_scopes=lambda token:set(token), HomeAssistantError=HomeAssistantError,UpdateFailed=UpdateFailed,ConfigEntryAuthFailed=ConfigEntryAuthFailed)
 exec(compile(ast.Module(body=[method],type_ignores=[]),str(source),'exec'),ns)
 run=ns['async_command']
 

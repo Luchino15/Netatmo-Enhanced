@@ -10,6 +10,7 @@ UNSEQUENCED_WINDOW = 60
 RESET_WINDOW = 120
 MAX_TRACKED_FIELDS = 4096
 MAX_RECENT_VALUES = 8
+BOOST_FRAGMENT_WINDOW = 60
 ROOM_FIELDS = {
     "therm_measured_temperature": "current_temperature",
     "humidity": "humidity",
@@ -28,6 +29,16 @@ HOME_FIELDS = {
 }
 HOME_MODES = ("schedule", "away", "hg", "off")
 ROOM_MODES = ("home", "manual", "hg")
+BOOST_MODE = "max"
+SETPOINT_FIELDS = {
+    f"{prefix}_setpoint_mode": (
+        f"{prefix}_setpoint_temperature", f"{prefix}_setpoint_end_time",
+    )
+    for prefix in ("therm", "cooling")
+}
+SETPOINT_DETAILS = {
+    name: mode_field for mode_field, fields in SETPOINT_FIELDS.items() for name in fields
+}
 
 
 def _mapping(value):
@@ -71,7 +82,11 @@ def _valid(field_name, value):
     if field_name.endswith("_end_time"):
         return value is None or type(value) is int and 0 <= value < 2**53
     if field_name.endswith("_mode"):
-        return value in ROOM_MODES
+        return (value in ROOM_MODES or field_name in SETPOINT_FIELDS and value == BOOST_MODE
+                or field_name == "cooling_setpoint_mode" and value == "off")
+    if field_name in SETPOINT_DETAILS and value is None:
+        # Authorization of a null target requires the corresponding room mode.
+        return True
     if field_name == "humidity":
         return number(value) is not None and 0 <= value <= 100
     return number(value) is not None and -100 <= value <= 150
@@ -138,6 +153,7 @@ class _FieldOrder:
     recent: deque = field(default_factory=lambda: deque(maxlen=MAX_RECENT_VALUES))
     candidate: tuple | None = None
     retired: tuple | None = None
+    boost_floor: int | None = None
 
 
 class PushState:
@@ -146,6 +162,7 @@ class PushState:
     def __init__(self, clock=monotonic):
         self._clock = clock
         self._orders = OrderedDict()
+        self._boost_nulls = OrderedDict()
 
     def _decision(self, key, sequence, value, current, now, reasons, remember_noop):
         order = self._orders.get(key)
@@ -220,9 +237,16 @@ class PushState:
                         if order.retired is not None:
                             old_high = max(old_high, order.retired[0])
                         order.retired = (old_high, now + RESET_WINDOW)
+                    if key[3] in SETPOINT_FIELDS and (
+                        order.boost_floor is not None or value == BOOST_MODE
+                    ):
+                        order.boost_floor = sequence
                     order.sequence = sequence
                     order.value = value
                 order.candidate = None
+        for key, (_, received) in list(self._boost_nulls.items()):
+            if key[:3] not in current or now - received >= BOOST_FRAGMENT_WINDOW:
+                del self._boost_nulls[key]
 
     def apply(self, data, payload):
         """Return a copy-on-write state and the independently verified field updates."""
@@ -386,14 +410,120 @@ class PushState:
                     fields.clear()
         return updates
 
+    def _with_held_boost_details(self, scope, updates, now):
+        """Pair a detail fragment with a matching explicit Boost transition."""
+        for mode_field, (target, expiry) in SETPOINT_FIELDS.items():
+            if mode_field not in updates:
+                continue
+            sequence, mode = updates[mode_field]
+            detail = target if mode == BOOST_MODE else expiry
+            held = self._boost_nulls.get((*scope, detail))
+            if (detail not in updates and held is not None and sequence == held[0]
+                    and now - held[1] < BOOST_FRAGMENT_WINDOW):
+                updates = {**updates, detail: (sequence, None)}
+        return updates
+
+    def _hold_boost_null(self, key, sequence, now):
+        held = self._boost_nulls.get(key)
+        if (sequence is not None and (
+            held is None or sequence >= held[0] or now - held[1] >= BOOST_FRAGMENT_WINDOW
+        )):
+            self._boost_nulls[key] = (sequence, now)
+            self._boost_nulls.move_to_end(key)
+            if len(self._boost_nulls) > MAX_TRACKED_FIELDS:
+                self._boost_nulls.popitem(last=False)
+
+    def _boost_field(self, scope, name, updates, filtered, previous, now):
+        """Check the mode and ordering context of a temporary setpoint field."""
+        sequence, value = updates[name]
+        mode_field = SETPOINT_DETAILS[name]
+        old_mode = previous.get(mode_field)
+        current_mode = filtered.get(mode_field, old_mode)
+        order = self._orders.get((*scope, mode_field))
+        floor = order.boost_floor if order is not None else None
+        incoming_mode = updates.get(mode_field)
+        if mode_field in filtered and (old_mode == BOOST_MODE) != (current_mode == BOOST_MODE):
+            floor = incoming_mode[0]
+        if floor is not None:
+            if sequence is None and value != previous.get(name):
+                return "ambiguous", "unsequenced_reversal"
+            if sequence is not None and sequence < floor:
+                return "obsolete", "sequence_out_of_order"
+        target, expiry = SETPOINT_FIELDS[mode_field]
+        if name == target and value is None:
+            if current_mode == BOOST_MODE and (
+                incoming_mode is None or incoming_mode[1] == BOOST_MODE
+            ):
+                return None, None
+            if incoming_mode is None:
+                self._hold_boost_null((*scope, name), sequence, now)
+            return "ambiguous", "boost_context_missing"
+        if name == expiry and current_mode == BOOST_MODE and not value:
+            if incoming_mode is None and value is None:
+                self._hold_boost_null((*scope, name), sequence, now)
+            return "ambiguous", "boost_details_missing"
+        return None, None
+
+    def _remember_boost_transition(self, scope, updates, filtered, previous, reasons):
+        for mode_field, details in SETPOINT_FIELDS.items():
+            for name in details:
+                if name in filtered:
+                    self._boost_nulls.pop((*scope, name), None)
+            old_boost = previous.get(mode_field) == BOOST_MODE
+            boost = filtered.get(mode_field, previous.get(mode_field)) == BOOST_MODE
+            expiry = details[1]
+            if mode_field in filtered:
+                sequence = updates[mode_field][0]
+                order = self._orders[(*scope, mode_field)]
+                if old_boost != boost:
+                    order.boost_floor = sequence
+                    self._associate_boost_details(scope, details, sequence, filtered, previous,
+                                                  boost, reasons)
+                elif boost and order.boost_floor is None:
+                    order.boost_floor = sequence
+            if expiry in filtered:
+                prefix = mode_field.removesuffix("_setpoint_mode")
+                filtered[f"{prefix}_end_time_is_boost"] = boost
+
+    def _associate_boost_details(self, scope, details, sequence, filtered, previous, boost, reasons):
+        for name in details:
+            if name in filtered:
+                continue
+            order = self._orders.get((*scope, name))
+            if (sequence is None or order is None or order.sequence != sequence
+                    or previous.get(name) != order.value):
+                reasons.add("boost_details_missing")
+            elif name == details[1]:
+                if boost and not order.value:
+                    reasons.add("boost_details_missing")
+                else:
+                    # The deadline was reported first in the same update.
+                    filtered[name] = order.value
+
     def _merge_fields(
         self, scope, members, result, accepted, updates, companions, now, reasons, outcomes,
         *, ignore_noop=(),
     ):
         filtered = {}
-        for name, (sequence, value) in updates.items():
+        boost_scope = scope[1] == "room"
+        if boost_scope:
+            updates = self._with_held_boost_details(scope, updates, now)
+        previous = next(iter(members.values()))
+        # Resolve the mode first, so obsolete/conflicting modes cannot legalize a null.
+        ordered_updates = sorted(updates, key=lambda name: name not in SETPOINT_FIELDS)
+        for name in ordered_updates:
+            sequence, value = updates[name]
             current = next((state.get(name) for state in members.values()
                             if state.get(name) != value), value)
+            if boost_scope and name in SETPOINT_DETAILS:
+                outcome, reason = self._boost_field(
+                    scope, name, updates, filtered, previous, now
+                )
+                if outcome is not None:
+                    outcomes.add(outcome)
+                    if outcome == "ambiguous" or current != value:
+                        reasons.add(reason)
+                    continue
             decision = self._decision(
                 (*scope, name), sequence, value, current, now, reasons, name not in ignore_noop
             )
@@ -413,6 +543,8 @@ class PushState:
         for name, value in tuple(filtered.items()):
             self._remember((*scope, name), updates[name][0], value, now)
             filtered.update(companions.get(name, {}))
+        if boost_scope:
+            self._remember_boost_transition(scope, updates, filtered, previous, reasons)
         for mid in members:
             existing = result[mid]
             accepted.setdefault(mid, set()).update(filtered)

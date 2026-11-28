@@ -12,10 +12,13 @@ from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from .const import BASE_URL, DOMAIN, SCOPES, token_scopes
-from .commands import command, confirmed
+from .commands import (
+    BOOST_DURATIONS, DEADLINE_TOLERANCE_SECONDS, SEASON_PREFIX, command, confirmed,
+    requested_duration,
+)
 from .cloud_push import PushState
 from .model import discover, project, snapshot
-from .telemetry import ApiMetrics, elapsed_ms, utc_now
+from .telemetry import ApiMetrics, ControlHistory, elapsed_ms, utc_now
 from .webhook_core import API_URL, MIN_REFRESH_SECONDS
 
 _LOGGER = logging.getLogger(__name__)
@@ -23,6 +26,12 @@ POLL_SECONDS = 600
 PUSH_API_GRACE_SECONDS = 30
 API_FAILURE_GRACE_SECONDS = 2 * POLL_SECONDS
 COMMAND_PUSH_WAIT_SECONDS = 3
+NEW_COMMANDS = {"boost", "stop_boost", "cycle_boost", "power_off", "temperature_duration"}
+DEADLINE_PARTNERS = {
+    f"{prefix}_{first}": f"{prefix}_{second}"
+    for prefix in SEASON_PREFIX.values()
+    for first, second in (("setpoint_end_time", "end_time_is_boost"), ("end_time_is_boost", "setpoint_end_time"))
+}
 _UNVERIFIED = object()
 
 
@@ -50,11 +59,14 @@ class CommandObservation:
     required: set = field(default_factory=set)
     armed: bool = False
     preserve_manual_override: bool = False
+    minutes: int | None = None
+    deadline: int | None = None
+    label: str | None = None
 
     def matches(self, state):
         return (_same_device(self.before, state) and state.get("reachable") is not False
                 and self.required <= self.observed
-                and confirmed(self.before, state, self.kind, self.value))
+                and confirmed(self.before, state, self.kind, self.value, deadline=self.deadline))
 
 
 def _same_device(first, second):
@@ -101,6 +113,8 @@ class EnhancedCoordinator(DataUpdateCoordinator):
         self._poll_handle = None
         self._poll_task = None
         self._command_observation = None
+        self._controls = ControlHistory()
+        self._known_boosts = {}
 
     @callback
     def async_set_cloud_push(self, enabled):
@@ -172,7 +186,10 @@ class EnhancedCoordinator(DataUpdateCoordinator):
                         observation.revision = self._push_revision
             self._observe_command(result)
         if result.changed:
-            self._last_push = utc_now().isoformat()
+            stamp = utc_now()
+            self._last_push = stamp.isoformat()
+            self._controls.observe(previous, result.data, "push", stamp)
+            self._learn_boosts(previous, result.data, result.accepted, stamp.timestamp())
             self.data = result.data
             self.async_update_listeners()
         return result
@@ -201,6 +218,7 @@ class EnhancedCoordinator(DataUpdateCoordinator):
             "poll_scheduled": self._poll_handle is not None if self.cloud_push else bool(self._unsub_refresh),
             "poll_disabled_in_home_assistant": self.config_entry.pref_disable_polling,
             "api_push_grace_seconds": PUSH_API_GRACE_SECONDS,
+            "controls": self._controls.snapshot(),
         }
 
     async def async_refresh_for(self, source, timing=None):
@@ -351,7 +369,7 @@ class EnhancedCoordinator(DataUpdateCoordinator):
             # unrelated to this write. Arm only at the HTTP send boundary.
             pending = self._command_observation
             if pending is not None and not pending.armed and endpoint not in {"homesdata", "homestatus"}:
-                self._arm_command(pending)
+                endpoint, form, json_body = self._arm_command(pending)
             try:
                 path = f"/api/{endpoint}"
                 status, payload, rate_limit = await self._http_json(
@@ -395,6 +413,11 @@ class EnhancedCoordinator(DataUpdateCoordinator):
             fresh = self._merge_api_push(fresh, revision, start, source)
         else:
             self._push_fields.clear()
+        self._controls.observe(self.data or {}, fresh, "api", utc_now())
+        for mid, (context, _) in list(self._known_boosts.items()):
+            state = fresh.get(mid, {})
+            if state.get("room_mode") != "max" or self._boost_context(state) != context:
+                del self._known_boosts[mid]
         return fresh
 
     def _merge_api_push(self, fresh, revision, started, source):
@@ -439,6 +462,9 @@ class EnhancedCoordinator(DataUpdateCoordinator):
                 if key in {"boiler_status", "cooler_status"}:
                     overlay.update(boiler_status=old.get("boiler_status"),
                                    cooler_status=old.get("cooler_status"))
+                if key in DEADLINE_PARTNERS:
+                    partner = DEADLINE_PARTNERS[key]
+                    overlay[partner] = old.get(partner)
                 protected.add(identity)
             else:
                 del self._push_fields[identity]
@@ -483,7 +509,10 @@ class EnhancedCoordinator(DataUpdateCoordinator):
         return result
 
     async def async_command(self, mid, kind, value):
-        if getattr(self, "cloud_push", False):
+        old = (self.data or {}).get(mid, {})
+        is_new_auto = (kind == "preset" and value == "schedule"
+                       and (old.get("season") == "cooling" or old.get("room_mode") == "max"))
+        if getattr(self, "cloud_push", False) or kind in NEW_COMMANDS or is_new_auto:
             await self._async_push_command(mid, kind, value)
             return
         async with self.command_lock:
@@ -543,13 +572,51 @@ class EnhancedCoordinator(DataUpdateCoordinator):
                     or before.get("season") != old.get("season")):
                 raise HomeAssistantError("Stato o stagione cambiati: controlla i valori e riprova")
 
-            after, raw, endpoint = await self._write_and_verify(mid, before, kind, value)
+            label = kind if kind in NEW_COMMANDS else None
+            if kind == "preset" and value == "schedule" and before.get("season") == "cooling":
+                label = "cooling_auto"
+            if kind == "cycle_boost":
+                kind, value = self._next_boost(mid, before)
+            after, raw, endpoint = await self._write_and_verify(
+                mid, before, kind, value, label=label,
+                preserve_manual_override=label in {"cycle_boost", "stop_boost"},
+            )
             if (kind == "preset" and value == "schedule" and endpoint == "setthermmode"
                     and self._needs_room_return(before, after, raw)):
                 after, _, _ = await self._write_and_verify(mid, after, kind, value, preserve_manual_override=True)
-            if not after or not confirmed(before, after, kind, value):
+            if not after or (kind == "preset" and not confirmed(before, after, kind, value)):
                 self._push_counts["commands_unconfirmed"] += 1
                 raise HomeAssistantError("Comando accettato dalle API, ma stato non ancora confermato. Controlla l'app e aggiorna i dati; non ripetere subito il comando.")
+
+    @staticmethod
+    def _boost_context(state):
+        return tuple(state.get(key) for key in ("home_id", "room_id", "season", "setpoint_end_time"))
+
+    def _learn_boosts(self, previous, current, accepted, received):
+        for mid, state in current.items():
+            old = previous.get(mid, {})
+            expiry = state.get("setpoint_end_time")
+            if state.get("room_mode") != "max" or type(expiry) not in (int, float):
+                self._known_boosts.pop(mid, None)
+            elif old.get("room_mode") != "max" or self._boost_context(old) != self._boost_context(state):
+                self._known_boosts.pop(mid, None)
+                prefix = SEASON_PREFIX[state["season"]]
+                if f"{prefix}_setpoint_end_time" not in accepted.get(mid, ()):
+                    continue
+                for minutes in BOOST_DURATIONS:
+                    if abs(expiry - received - minutes * 60) <= DEADLINE_TOLERANCE_SECONDS:
+                        self._known_boosts[mid] = (self._boost_context(state), minutes)
+                        break
+
+    def _next_boost(self, mid, current):
+        if current.get("room_mode") != "max":
+            return "boost", BOOST_DURATIONS[0]
+        known = self._known_boosts.get(mid)
+        if (known is None or known[0] != self._boost_context(current)
+                or current["setpoint_end_time"] <= utc_now().timestamp()):
+            raise HomeAssistantError("Durata Boost sconosciuta: scegli 30, 60 o 90 minuti oppure interrompilo")
+        step = BOOST_DURATIONS.index(known[1]) + 1
+        return ("boost", BOOST_DURATIONS[step]) if step < len(BOOST_DURATIONS) else ("stop_boost", None)
 
     def _arm_command(self, pending):
         current = (self.data or {}).get(pending.mid, {})
@@ -558,26 +625,37 @@ class EnhancedCoordinator(DataUpdateCoordinator):
         if (not _same_device(pending.before, current)
                 or current.get("season") != pending.before.get("season")
                 or (pending.preserve_manual_override
-                    and not self._same_manual_override(pending.before, current))
-                or command(current, pending.kind, pending.value) != pending.request):
+                    and not self._same_override(pending.before, current))
+                or command(current, pending.kind, pending.value, deadline=pending.deadline) != pending.request):
             raise HomeAssistantError("Stato o stagione cambiati: controlla i valori e riprova")
+        if pending.minutes is not None:
+            pending.deadline = int(utc_now().timestamp()) + pending.minutes * 60
+            pending.request = command(current, pending.kind, pending.value, deadline=pending.deadline)
         pending.armed = True
+        return pending.request
 
-    async def _write_and_verify(self, mid, before, kind, value, *, preserve_manual_override=False):
+    async def _write_and_verify(self, mid, before, kind, value, *, preserve_manual_override=False, label=None):
         try:
-            request = command(before, kind, value)
+            minutes = requested_duration(kind, value)
+            deadline = int(utc_now().timestamp()) + minutes * 60 if minutes is not None else None
+            request = command(before, kind, value, deadline=deadline)
         except ValueError as exc:
             raise HomeAssistantError(str(exc)) from exc
         endpoint, form, body = request
         pending = CommandObservation(mid, before, kind, value, request,
-                                     preserve_manual_override=preserve_manual_override)
-        prefix = "therm" if before["season"] == "heating" else "cooling"
-        if kind == "temperature":
+                                     preserve_manual_override=preserve_manual_override,
+                                     minutes=minutes, deadline=deadline, label=label)
+        prefix = SEASON_PREFIX[before["season"]]
+        if kind in {"temperature", "temperature_duration"}:
             pending.required = {f"{prefix}_setpoint_mode", f"{prefix}_setpoint_temperature"}
+            if kind == "temperature_duration":
+                pending.required.add(f"{prefix}_setpoint_end_time")
+        elif kind in {"boost", "stop_boost"}:
+            pending.required = {f"{prefix}_setpoint_mode", f"{prefix}_setpoint_end_time"}
         elif kind == "schedule":
             pending.required = {"heating_schedule_id" if prefix == "therm" else "cooling_schedule_id"}
         else:
-            pending.required = {"therm_setpoint_mode" if endpoint == "setstate" else "therm_mode"}
+            pending.required = {f"{prefix}_setpoint_mode" if endpoint == "setstate" else "therm_mode"}
         self._command_observation = pending
         try:
             try:
@@ -593,9 +671,11 @@ class EnhancedCoordinator(DataUpdateCoordinator):
                         await pending.ready.wait()
                 except TimeoutError:
                     pass
+            else:
+                await asyncio.sleep(COMMAND_PUSH_WAIT_SECONDS)
             after = (self.data or {}).get(mid, {})
             if pending.ready.is_set() and pending.matches(after):
-                self._push_counts["commands_confirmed_by_push"] += 1
+                self._verified_command(pending, after, "push")
                 return after, {}, endpoint
 
             self._push_counts["command_api_verifications"] += 1
@@ -604,31 +684,42 @@ class EnhancedCoordinator(DataUpdateCoordinator):
             after = (self.data or {}).get(mid, {})
             raw = self._last_raw_api.get(mid, {})
             if pending.ready.is_set() and pending.matches(after):
-                self._push_counts["commands_confirmed_by_push"] += 1
+                self._verified_command(pending, after, "push")
                 return after, {}, endpoint
             if (timing.get("outcome") == "success" and _same_device(before, after)
                     and _same_device(before, raw) and after.get("reachable") is not False
                     and raw.get("reachable") is not False):
-                if confirmed(before, raw, kind, value) and confirmed(before, after, kind, value):
-                    self._push_counts["commands_confirmed_by_api"] += 1
+                if (confirmed(before, raw, kind, value, deadline=pending.deadline)
+                        and confirmed(before, after, kind, value, deadline=pending.deadline)):
+                    self._verified_command(pending, after, "api")
                     return after, raw, endpoint
                 if kind == "preset" and value == "schedule" and endpoint == "setthermmode":
                     return after, raw, endpoint
+            self._controls.command(pending.label, "unconfirmed", minutes=pending.minutes)
             return {}, {}, endpoint
+        except HomeAssistantError:
+            self._controls.command(pending.label, "failed", minutes=pending.minutes)
+            raise
         finally:
             self._command_observation = None
+
+    def _verified_command(self, pending, after, source):
+        self._push_counts[f"commands_confirmed_by_{source}"] += 1
+        self._controls.command(pending.label, source, minutes=pending.minutes)
+        if pending.kind == "boost":
+            self._known_boosts[pending.mid] = (self._boost_context(after), pending.minutes)
 
     def _needs_room_return(self, before, after, raw):
         """Only an API-confirmed intermediate state can lead to a second write."""
         return (
-            bool(raw) and before.get("room_mode") == "manual"
+            bool(raw) and before.get("room_mode") in {"manual", "max"}
             and all(state.get("season") == before["season"]
                     and state.get("home_mode") in {"home", "schedule"}
-                    and state.get("room_mode") == "manual"
-                    and self._same_manual_override(before, state)
+                    and self._same_override(before, state)
                     for state in (after, raw))
         )
 
     @staticmethod
-    def _same_manual_override(before, after):
-        return all(before.get(key) == after.get(key) for key in ("target_temperature", "setpoint_end_time"))
+    def _same_override(before, after):
+        return all(before.get(key) == after.get(key)
+                   for key in ("room_mode", "target_temperature", "setpoint_end_time"))

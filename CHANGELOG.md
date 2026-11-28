@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.0 — Experimental Smarther controls
+
+- Recognizes heating Boost reported by Smarther, including a null target temperature and the device’s override expiry.
+- Adds a 90-minute Boost preset and actions to select 30, 60 or 90 minutes, cycle the duration and stop Boost in either season. Confirmation uses the authenticated webhook or an API read.
+- Adds an explicit-duration manual temperature action and a timestamp sensor for the confirmed override expiry. The standard temperature control remains available in both seasons.
+- Adds experimental cooling Off and Auto commands to the room climate entity.
+- Records recent control transitions and confirmation paths in the bounded diagnostics history.
+- Documents the field test and Marketplace rollback to 0.4.0.
+
 ## 0.4.0 — Experimental Cloud Push
 
 - Adds an opt-in mode that applies authenticated room, module and home changes directly to Home Assistant. The four webhook modes can be changed on the existing config entry.

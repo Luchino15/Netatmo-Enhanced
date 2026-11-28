@@ -82,6 +82,163 @@ class PushProjectionTests(unittest.TestCase):
         self.assert_values(mode="home", room_mode="home", home_mode="schedule",
                            target_temperature=19, setpoint_end_time=None)
 
+    def test_heating_boost_replay_changes_deadline_and_resumes_real_target(self):
+        first_deadline = 2_100_000_000
+        activation = room_event(
+            110, therm_setpoint_mode="max", therm_setpoint_temperature=None,
+            therm_setpoint_end_time=first_deadline, therm_measured_temperature=20,
+        )
+        start = self.apply(activation)
+        self.assertFalse(start.reasons)
+        self.assertEqual(start.accepted[MODULE], {
+            "therm_setpoint_mode", "therm_setpoint_temperature", "therm_setpoint_end_time",
+            "therm_end_time_is_boost", "current_temperature",
+        })
+        self.assert_values(room_mode="max", mode="max", home_mode="schedule",
+                           target_temperature=None, setpoint_end_time=first_deadline,
+                           boiler_status=False, current_temperature=20, humidity=51)
+        self.assertFalse(self.apply(module_event(110, True, False)).reasons)
+        self.assert_values(boiler_status=True)
+
+        for sequence, minutes in enumerate((60, 90), start=111):
+            with self.subTest(minutes=minutes):
+                deadline = first_deadline + (minutes - 30) * 60
+                duration = self.apply(room_event(
+                    sequence, therm_setpoint_mode="max", therm_setpoint_temperature=None,
+                    therm_setpoint_end_time=deadline,
+                ))
+                self.assertFalse(duration.reasons)
+                self.assert_values(mode="max", target_temperature=None, setpoint_end_time=deadline)
+
+        # The observed stop and the fixture modelling natural expiration have
+        # the same known shape. Only a confirmed room event restores the setpoint.
+        for termination in (113, 115):
+            with self.subTest(termination=termination):
+                stop = self.apply(room_event(
+                    termination, therm_setpoint_mode="home", therm_setpoint_temperature=19,
+                    therm_setpoint_end_time=None,
+                ))
+                self.assertFalse(stop.reasons)
+                self.assert_values(room_mode="home", mode="home", home_mode="schedule",
+                                   target_temperature=19, setpoint_end_time=None)
+                self.assertFalse(self.apply(module_event(termination, False, False)).reasons)
+                self.assert_values(boiler_status=False)
+                if termination == 113:
+                    self.apply(room_event(
+                        114, therm_setpoint_mode="max", therm_setpoint_temperature=None,
+                        therm_setpoint_end_time=first_deadline + 7_200,
+                    ))
+
+    def test_boost_fragments_preserve_missing_fields_and_pair_explicit_nulls(self):
+        deadline = 2_100_000_000
+        result = self.apply(room_event(120, therm_setpoint_temperature=None))
+        self.assertIn("boost_context_missing", result.reasons)
+        self.assert_values(room_mode="home", target_temperature=18)
+        result = self.apply(room_event(
+            120, therm_setpoint_mode="max", therm_setpoint_end_time=deadline,
+        ))
+        self.assertFalse(result.reasons)
+        self.assertIn("therm_setpoint_temperature", result.accepted[MODULE])
+        self.assert_values(room_mode="max", target_temperature=None, setpoint_end_time=deadline)
+
+        self.apply(room_event(120, humidity=54))
+        self.assert_values(mode="max", humidity=54, setpoint_end_time=deadline)
+        result = self.apply(room_event(121, therm_setpoint_end_time=None))
+        self.assertIn("boost_details_missing", result.reasons)
+        self.assert_values(mode="max", setpoint_end_time=deadline)
+        result = self.apply(room_event(
+            121, therm_setpoint_mode="home", therm_setpoint_temperature=20,
+        ))
+        self.assertFalse(result.reasons)
+        self.assertIn("therm_setpoint_end_time", result.accepted[MODULE])
+        self.assert_values(mode="home", humidity=54, target_temperature=20, setpoint_end_time=None)
+
+    def test_mode_only_boost_displays_no_prior_target_and_accepts_same_sequence_fragments(self):
+        self.apply(room_event(129, therm_setpoint_mode="manual",
+                              therm_setpoint_end_time=2_099_999_800))
+        activation = self.apply(room_event(130, therm_setpoint_mode="max"))
+        self.assertIn("boost_details_missing", activation.reasons)
+        self.assert_values(mode="max", therm_setpoint_temperature=18, target_temperature=None,
+                           therm_setpoint_end_time=2_099_999_800, setpoint_end_time=None)
+        without_order = self.apply(room_event(therm_setpoint_end_time=2_099_999_900))
+        self.assertFalse(without_order.changed)
+        self.assertIn("unsequenced_reversal", without_order.reasons)
+        details = self.apply(room_event(
+            130, therm_setpoint_temperature=None, therm_setpoint_end_time=2_100_000_000,
+        ))
+        self.assertFalse(details.reasons)
+        self.assert_values(mode="max", therm_setpoint_temperature=None,
+                           target_temperature=None, setpoint_end_time=2_100_000_000)
+
+    def test_deadline_fragment_from_before_same_sequence_boost_mode_is_associated(self):
+        deadline = 2_100_000_000
+        self.apply(room_event(135, therm_setpoint_end_time=deadline))
+        result = self.apply(room_event(
+            135, therm_setpoint_mode="max", therm_setpoint_temperature=None,
+        ))
+        self.assertFalse(result.reasons)
+        self.assertIn("therm_setpoint_end_time", result.accepted[MODULE])
+        self.assert_values(mode="max", target_temperature=None, setpoint_end_time=deadline)
+
+    def test_boost_out_of_order_and_duplicate_packets_do_not_restore_stale_state(self):
+        deadline = 2_100_000_000
+        activation = room_event(
+            140, therm_setpoint_mode="max", therm_setpoint_temperature=None,
+            therm_setpoint_end_time=deadline,
+        )
+        self.apply(activation)
+        duplicate = self.apply(activation)
+        self.assertFalse(duplicate.changed)
+        self.assertEqual(duplicate.outcomes, {"duplicate"})
+        self.apply(room_event(
+            142, therm_setpoint_mode="home", therm_setpoint_temperature=20,
+        ))
+        self.assert_values(therm_setpoint_end_time=deadline, setpoint_end_time=None)
+        stale = self.apply(room_event(141, therm_setpoint_end_time=deadline + 1_800))
+        self.assertIn("obsolete", stale.outcomes)
+        self.assertFalse(stale.changed)
+        stale = self.apply(activation)
+        self.assertFalse(stale.changed)
+        self.assert_values(mode="home", target_temperature=20)
+        self.assertFalse(self.apply(room_event(142, therm_setpoint_end_time=None)).reasons)
+        self.assert_values(mode="home", target_temperature=20, setpoint_end_time=None)
+
+    def test_cooling_boost_and_off_keep_null_validation_contextual(self):
+        self.apply(season_event("cooling"))
+        invalid = self.apply(room_event(150, cooling_setpoint_mode="off",
+                                        cooling_setpoint_temperature=None))
+        self.assertIn("boost_context_missing", invalid.reasons)
+        self.assert_values(mode="off", target_temperature=26)
+
+        valid = self.apply(room_event(
+            151, cooling_setpoint_mode="max", cooling_setpoint_temperature=None,
+            cooling_setpoint_end_time=2_100_000_000,
+        ))
+        self.assertFalse(valid.reasons)
+        self.assert_values(mode="max", target_temperature=None, setpoint_end_time=2_100_000_000)
+
+        invalid = self.apply(room_event(152, therm_setpoint_temperature=None))
+        self.assertIn("boost_context_missing", invalid.reasons)
+        self.assert_values(mode="max", therm_setpoint_temperature=18)
+        stop = self.apply(room_event(
+            153, cooling_setpoint_mode="home", cooling_setpoint_temperature=25,
+            cooling_setpoint_end_time=None,
+        ))
+        self.assertFalse(stop.reasons)
+        self.assert_values(mode="home", target_temperature=25, setpoint_end_time=None)
+
+    def test_api_boost_with_old_numeric_target_never_exposes_a_boost_setpoint(self):
+        for season, field in (("heating", "therm"), ("cooling", "cooling")):
+            with self.subTest(season=season):
+                state = model.project({
+                    **api_state(), "season": season, f"{field}_setpoint_mode": "max",
+                    f"{field}_setpoint_end_time": 2_100_000_000,
+                    f"{field}_end_time_is_boost": True,
+                })
+                self.assertEqual(state["mode"], "max")
+                self.assertIsNone(state["target_temperature"])
+                self.assertEqual(state["setpoint_end_time"], 2_100_000_000)
+
     def test_away_and_frost_guard_keep_global_and_local_modes_separate(self):
         self.assertFalse(self.apply(heating_mode_event("away")).reasons)
         self.apply(room_event(100, therm_setpoint_mode="home", therm_setpoint_temperature=14))

@@ -8,6 +8,7 @@ import secrets
 from time import monotonic
 
 EVENT_LIMIT = 100
+CONTROL_EVENT_LIMIT = 40
 MAX_DEPTH = 8
 MAX_ITEMS = 24
 MAX_NODES = 160
@@ -205,3 +206,61 @@ class ApiMetrics:
             ],
             "coordinator_updates": {source: dict(counts) for source, counts in self._updates.items()},
         }
+
+
+class ControlHistory:
+    """Keep control transitions and confirmations across ambient-event bursts."""
+
+    def __init__(self):
+        self._events = deque(maxlen=CONTROL_EVENT_LIMIT)
+        self._counts = Counter()
+
+    def _record(self, kind, source, stamp, **details):
+        self._counts[kind] += 1
+        self._events.append({"kind": kind, "source": source, "at_utc": stamp.isoformat(), **details})
+
+    def command(self, kind, outcome, *, minutes=None):
+        if kind is None:
+            return
+        details = {"action": kind}
+        if minutes is not None:
+            details["requested_minutes"] = minutes
+        self._record(f"command_{outcome}", "command", utc_now(), **details)
+
+    def observe(self, previous, current, source, stamp):
+        for mid, state in current.items():
+            old = previous.get(mid)
+            if not old or any(old.get(key) != state.get(key) for key in ("home_id", "room_id")):
+                continue
+            season = state.get("season")
+            if season not in {"heating", "cooling"}:
+                continue
+            if old.get("season") != season:
+                self._record("season_changed", source, stamp, season=season)
+                continue
+
+            before, after = old.get("room_mode"), state.get("room_mode")
+            old_end, end = old.get("setpoint_end_time"), state.get("setpoint_end_time")
+            kind = None
+            if after == "max":
+                if before != "max":
+                    kind = "boost_started"
+                elif old_end != end:
+                    kind = "boost_deadline_changed"
+            elif before == "max" and after is not None:
+                reached = type(old_end) in (int, float) and stamp.timestamp() >= old_end
+                kind = "boost_return_after_deadline" if reached else "boost_stopped"
+            elif after == "manual" and old_end != end and end is not None:
+                kind = "manual_deadline_changed"
+            if kind:
+                details = {"season": season}
+                if after in {"manual", "max"} and type(end) in (int, float):
+                    details["deadline_unix"] = end
+                self._record(kind, source, stamp, **details)
+            if after == "off" and before != "off":
+                self._record("room_off", source, stamp, season=season)
+            elif before == "off" and after is not None and after != "off":
+                self._record("room_resumed", source, stamp, season=season)
+
+    def snapshot(self):
+        return {"counts": dict(self._counts), "recent": [dict(event) for event in self._events]}

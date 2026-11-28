@@ -14,6 +14,34 @@ from test_webhook import CALLBACK, SECRET, body, core, package, signed, urls
 telemetry = importlib.import_module(f"{package.__name__}.telemetry")
 
 
+class ControlHistoryTests(unittest.TestCase):
+    def test_significant_events_survive_ambient_burst_without_private_ids(self):
+        history = telemetry.ControlHistory()
+        stamp = datetime(2028, 1, 1, tzinfo=UTC)
+        idle = {"home_id": "private-home", "room_id": "private-room", "season": "heating",
+                "room_mode": "home", "setpoint_end_time": None}
+        active = {**idle, "room_mode": "max", "setpoint_end_time": int(stamp.timestamp()) + 1800}
+        extended = {**active, "setpoint_end_time": active["setpoint_end_time"] + 1800}
+        history.observe({"private-module": idle}, {"private-module": active}, "push", stamp)
+        history.observe({"private-module": active}, {"private-module": extended}, "push", stamp)
+        elapsed = datetime.fromtimestamp(extended["setpoint_end_time"], UTC)
+        history.observe({"private-module": extended}, {"private-module": idle}, "api", elapsed)
+        for sample in range(120):
+            history.observe({"private-module": idle}, {"private-module": {**idle, "humidity": sample}}, "push", elapsed)
+        report = history.snapshot()
+        self.assertEqual([event["kind"] for event in report["recent"]],
+                         ["boost_started", "boost_deadline_changed", "boost_return_after_deadline"])
+        self.assertNotIn("private", json.dumps(report))
+
+    def test_significant_history_has_independent_bound_and_total(self):
+        history = telemetry.ControlHistory()
+        for _ in range(telemetry.CONTROL_EVENT_LIMIT + 2):
+            history.command("boost", "push", minutes=30)
+        report = history.snapshot()
+        self.assertEqual(len(report["recent"]), telemetry.CONTROL_EVENT_LIMIT)
+        self.assertEqual(report["counts"], {"command_push": telemetry.CONTROL_EVENT_LIMIT + 2})
+
+
 class ProjectionTests(unittest.TestCase):
     def test_allowlist_pseudonyms_and_unknown_shape(self):
         personal = "secret-value-123"
@@ -117,6 +145,7 @@ class RegistrationTests(unittest.IsolatedAsyncioTestCase):
 class FakeCoordinator:
     def __init__(self, *args, **kwargs):
         self.last_update_success = True
+        self.data = None
         self._lock = asyncio.Lock()
 
     async def async_refresh(self):

@@ -52,8 +52,9 @@ def entity_platforms():
                 HVACMode=HVACMode, HVACAction=HVACAction,
             ),
             "homeassistant.components.sensor": SimpleNamespace(
-                SensorEntity=object, SensorDeviceClass=SimpleNamespace(TEMPERATURE="temperature",
-                                                                      HUMIDITY="humidity"),
+                SensorEntity=object, SensorDeviceClass=SimpleNamespace(
+                    TEMPERATURE="temperature", HUMIDITY="humidity", TIMESTAMP="timestamp",
+                ),
                 SensorStateClass=SimpleNamespace(MEASUREMENT="measurement"),
             ),
             "homeassistant.components.select": SimpleNamespace(SelectEntity=object),
@@ -100,7 +101,7 @@ class PushIntegrationTests(unittest.IsolatedAsyncioTestCase):
                                       therm_setpoint_mode="home", therm_setpoint_temperature=24.5))
         await self.deliver(module_event(400, True, False))
         await self.deliver(room_event(400, humidity=57))
-        self.assertEqual((climate.current_temperature, target.native_value, humidity.native_value),
+        self.assertEqual((climate.native_current_temperature, target.native_value, humidity.native_value),
                          (22.7, 24.5, 57))
         self.assertEqual(climate.hvac_action, "heating")
 
@@ -231,7 +232,7 @@ class PushIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         after = await setup_entities(h.coordinator)
         self.assertEqual(set(after), set(before))
-        self.assertEqual(len(after), 10)
+        self.assertEqual(len(after), 11)
         for entity_id in before:
             with self.subTest(entity_id=entity_id):
                 before_ids = before[entity_id]._attr_device_info["identifiers"]

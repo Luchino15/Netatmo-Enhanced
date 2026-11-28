@@ -7,10 +7,18 @@ from homeassistant.helpers.config_entry_oauth2_flow import (
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from .const import SCOPES, token_scopes
 from .coordinator import EnhancedCoordinator
+from .services import async_setup_services
 from .webhook_core import MODE_KEY, MODE_OFF
 from .webhook_v1 import WebhookV1
 
 PLATFORMS = [Platform.SENSOR, Platform.CLIMATE, Platform.SELECT]
+
+
+async def async_setup(hass, _config):
+    """Register actions for Netatmo Enhanced climate entities."""
+    async_setup_services(hass)
+    return True
+
 
 async def async_setup_entry(hass, entry):
     if not SCOPES.issubset(token_scopes(entry.data.get("token", {}))):

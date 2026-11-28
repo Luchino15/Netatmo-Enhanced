@@ -34,6 +34,47 @@
       }
     }
   },
+  "entity": {
+    "sensor": {
+      "override_expires_at": {
+        "name": "Temporary override expiry"
+      }
+    }
+  },
+  "services": {
+    "set_boost": {
+      "name": "Set Boost",
+      "description": "Start or change Boost in the active season.",
+      "fields": {
+        "duration": {
+          "name": "Duration",
+          "description": "Choose 30, 60 or 90 minutes."
+        }
+      }
+    },
+    "cycle_boost": {
+      "name": "Cycle Boost duration",
+      "description": "Start at 30 minutes, then cycle through 60 minutes, 90 minutes and stop."
+    },
+    "stop_boost": {
+      "name": "Stop Boost",
+      "description": "End Boost and return the thermostat to the applicable room mode."
+    },
+    "set_manual_temperature": {
+      "name": "Set timed manual temperature",
+      "description": "Set a temporary manual target in the active season.",
+      "fields": {
+        "temperature": {
+          "name": "Temperature",
+          "description": "Target temperature in degrees Celsius."
+        },
+        "duration": {
+          "name": "Duration",
+          "description": "Manual override duration in whole minutes, from 1 through 720."
+        }
+      }
+    }
+  },
   "application_credentials": {
     "description": "Create a personal application at https://dev.netatmo.com/ and enter its client ID and client secret. Use a separate application for the official Netatmo integration."
   }
